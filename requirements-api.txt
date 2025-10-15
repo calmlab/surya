@@ -1,0 +1,19 @@
+# Surya API Additional Dependencies
+# Install with: pip install -r requirements-api.txt
+
+# FastAPI and web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# WebSocket support
+websockets>=12.0
+
+# Settings management
+pydantic-settings>=2.0.0
+
+# Already included in base surya but listing for clarity:
+# - pypdfium2 (PDF processing)
+# - Pillow (image processing)
+# - torch (already in surya)
+# - pydantic (already in surya)

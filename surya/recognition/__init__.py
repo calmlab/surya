@@ -299,8 +299,6 @@ class RecognitionPredictor(BasePredictor):
                             )
                         )
 
-                        # Ensure we don't exceed the bbox count
-                        # Use the last bbox for the rest of the text
                         if bbox_idx < len(bboxes) - 1:
                             bbox_idx += 1
                 elif token_type == "special":
