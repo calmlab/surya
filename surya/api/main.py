@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from surya.api.config import settings
-from surya.api.endpoints import page_ocr
+from surya.api.endpoints import page_ocr, image_ocr, layout_ocr
 
 # Create FastAPI app
 app = FastAPI(
@@ -27,6 +27,8 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Include routers
 app.include_router(page_ocr.router, tags=["OCR"])
+app.include_router(image_ocr.router, tags=["OCR"])
+app.include_router(layout_ocr.router, tags=["Layout + OCR"])
 
 
 @app.get("/")
@@ -38,6 +40,8 @@ async def root():
         "docs": "/docs",
         "endpoints": {
             "page_ocr": "/page_ocr - Direct page OCR without layout detection",
+            "image_ocr": "/image_ocr - OCR for base64-encoded image list",
+            "layout_ocr": "/layout_ocr - Layout detection + OCR integration (MinerU compatible)",
         }
     }
 
