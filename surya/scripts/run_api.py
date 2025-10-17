@@ -11,7 +11,7 @@ import uvicorn
 
 
 @click.command()
-@click.option('--host', default='127.0.0.1', help='Server host (default: 127.0.0.1)')
+@click.option('--host', default='0.0.0.0', help='Server host (default: 0.0.0.0)')
 @click.option('--port', default=8001, type=int, help='Server port (default: 8001)')
 @click.option('--reload', is_flag=True, help='Enable auto-reload (development mode)')
 @click.option('--workers', default=1, type=int, help='Number of workers (default: 1)')
