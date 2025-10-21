@@ -844,9 +844,476 @@ python /Users/pipaek/project/MinerU/examples/layout_ocr_client.py test.pdf \
 
 ---
 
-## 11. 참고 자료
+## 11. /layout_ocr 재개발 계획 (Plan 1 방식으로 전환)
 
-### 11.1 관련 파일
+### 11.1 배경 및 문제점
+
+#### 현재 구현 방식 (Plan 2)
+현재 `/layout_ocr` 및 `/layout_ocr_images` 엔드포인트는 다음과 같이 동작합니다:
+
+1. 페이지별로 Layout Detection 수행 → LayoutBox 추출
+2. 각 LayoutBox를 개별 이미지로 crop
+3. **각 cropped image마다 OCR을 반복 수행** (페이지당 100+ boxes)
+4. OCR 결과를 원본 좌표로 변환하여 LayoutBox에 할당
+
+**문제점**:
+- 페이지당 100개 이상의 LayoutBox에 대해 반복적으로 OCR 수행
+- Batch 처리에도 불구하고 과도한 모델 호출로 인한 심각한 성능 저하
+- **처리 시간**: 페이지당 수 분 소요 (사용 불가 수준)
+- **참고**: Layout Detection 단독 또는 Page OCR 단독 수행 시에는 페이지당 10-20초 수준
+
+#### 새로운 구현 방식 (Plan 1)
+성능 개선을 위해 다음과 같이 변경합니다:
+
+1. 페이지별로 Layout Detection 수행 → LayoutBox 추출
+2. **페이지 전체에 대해 OCR을 1회만 수행** → 모든 TextLine 추출
+3. TextLine의 중심점 좌표를 기준으로 LayoutBox에 매칭
+4. 매칭된 TextLine을 LayoutBox의 하위 요소로 구성
+
+**기대 효과**:
+- OCR 호출 횟수: 페이지당 100+ 회 → 1회로 대폭 감소
+- 처리 시간: Layout Detection + Page OCR 시간의 합 수준으로 개선 예상
+- API 인터페이스 및 응답 포맷은 변경 없음 (하위 호환성 유지)
+
+---
+
+### 11.2 핵심 구현 사항
+
+#### 11.2.1 TextLine ↔ LayoutBox 매칭 알고리즘
+
+**매칭 기준**: TextLine bbox의 **중심점**이 LayoutBox 영역에 포함되는지 확인
+
+**알고리즘**:
+```python
+def match_textlines_to_layout_boxes(
+    text_lines: List[TextLine],
+    layout_boxes: List[LayoutBox]
+) -> Dict[int, List[TextLine]]:
+    """
+    TextLine의 중심점을 기준으로 LayoutBox에 매칭
+
+    Args:
+        text_lines: 페이지 전체 OCR 결과의 TextLine 리스트
+        layout_boxes: Layout Detection 결과의 LayoutBox 리스트
+
+    Returns:
+        {box_index: [matched_textlines]} 형태의 딕셔너리
+        box_index = -1: orphan TextLines (어떤 box에도 속하지 않음)
+    """
+    matched_lines = {i: [] for i in range(len(layout_boxes))}
+    matched_lines[-1] = []  # Orphan lines
+
+    for text_line in text_lines:
+        # TextLine bbox 중심점 계산
+        x_center = (text_line.bbox[0] + text_line.bbox[2]) / 2
+        y_center = (text_line.bbox[1] + text_line.bbox[3]) / 2
+
+        # 중심점이 포함되는 LayoutBox 찾기
+        matched = False
+        for box_idx, layout_box in enumerate(layout_boxes):
+            if point_in_bbox(x_center, y_center, layout_box.bbox):
+                matched_lines[box_idx].append(text_line)
+                matched = True
+                break  # 첫 번째 매칭되는 box에만 할당
+
+        # 어떤 box에도 속하지 않는 orphan line
+        if not matched:
+            matched_lines[-1].append(text_line)
+
+    return matched_lines
+
+
+def point_in_bbox(x: float, y: float, bbox: List[float]) -> bool:
+    """
+    점(x, y)이 bbox [x0, y0, x1, y1] 내부에 있는지 확인
+    """
+    return bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
+```
+
+**특징**:
+- 중심점 기준으로 명확한 1:1 매칭 (TextLine이 여러 LayoutBox에 중복 할당되지 않음)
+- IoU나 겹침 비율은 사용하지 않음 (향후 실험을 통해 필요시 추가 검토)
+- Orphan TextLine은 별도로 처리 (다음 섹션 참조)
+
+#### 11.2.2 Orphan TextLine 처리
+
+**Orphan TextLine**: 중심점이 어떤 LayoutBox에도 포함되지 않는 TextLine
+
+**처리 방식**: 별도의 "orphan" LayoutBox 생성
+
+```python
+def create_orphan_layout_box(
+    orphan_lines: List[TextLine],
+    page_idx: int
+) -> LayoutBox:
+    """
+    Orphan TextLine들을 담을 가상의 LayoutBox 생성
+
+    Returns:
+        LayoutBox with label "Text" and bbox covering all orphan lines
+    """
+    if not orphan_lines:
+        return None
+
+    # 모든 orphan line을 포함하는 bounding box 계산
+    min_x = min(line.bbox[0] for line in orphan_lines)
+    min_y = min(line.bbox[1] for line in orphan_lines)
+    max_x = max(line.bbox[2] for line in orphan_lines)
+    max_y = max(line.bbox[3] for line in orphan_lines)
+
+    # 가상의 LayoutBox 생성
+    orphan_box = LayoutBox(
+        label="Text",  # Orphan은 일반 텍스트로 간주
+        bbox=[min_x, min_y, max_x, max_y],
+        polygon=[[min_x, min_y], [max_x, min_y],
+                 [max_x, max_y], [min_x, max_y]],
+        confidence=0.0,  # 가상 box이므로 confidence 0
+        position=999999  # Reading order 최하위
+    )
+
+    return orphan_box
+```
+
+**결과 포맷**:
+- Orphan box는 일반 layout_boxes 리스트 맨 뒤에 추가
+- `confidence: 0.0`으로 가상 box임을 표시
+- `position: 999999`로 reading order 최하위 배치
+- 클라이언트는 `confidence == 0.0`인 box를 orphan으로 인식 가능
+
+#### 11.2.3 Discarded Boxes 처리
+
+**Discarded Boxes**: PageHeader, PageFooter 등 `box_type: "discarded"`로 분류되는 boxes
+
+**처리 방식**:
+- 일반 LayoutBox와 동일하게 중심점 기준으로 TextLine 매칭
+- `include_discarded=True`인 경우에만 응답에 포함
+- 응답 JSON의 `discarded_boxes` 필드에 별도 저장
+
+```python
+# Format converter에서 처리
+if box_type == "discarded":
+    if include_discarded:
+        page_data["discarded_boxes"].append(layout_box_data)
+else:
+    page_data["layout_boxes"].append(layout_box_data)
+```
+
+---
+
+### 11.3 수정 대상 파일 및 함수
+
+#### 11.3.1 `surya/api/endpoints/layout_ocr.py`
+
+**수정 함수**: `process_images_with_layout_ocr()`
+
+**현재 로직 (Plan 2)**:
+```python
+# Step 1: Layout detection
+layout_results = layout_predictor(images)
+
+# Step 2: Crop each layout box and run OCR (반복!)
+for page_idx, (image, layout_result) in enumerate(zip(images, layout_results)):
+    cropped_boxes = crop_layout_boxes(image, layout_result.bboxes)
+    cropped_images = [crop[0] for crop in cropped_boxes]
+
+    # OCR on cropped boxes (100+ times per page!)
+    box_ocr_results = recognition_predictor(cropped_images, det_predictor)
+
+    # Adjust coordinates back to original...
+    all_page_box_ocrs.append(box_ocr_results)
+```
+
+**새로운 로직 (Plan 1)**:
+```python
+# Step 1: Layout detection
+layout_results = layout_predictor(images)
+
+# Step 2: Page-level OCR (1 time per page!)
+page_ocr_results = recognition_predictor(images, det_predictor)
+
+# Step 3: Match TextLines to LayoutBoxes
+# (format_converter에서 처리)
+```
+
+**변경 사항**:
+1. `crop_layout_boxes()` 호출 제거
+2. `box_ocr_results` 대신 `page_ocr_results` 사용
+3. 좌표 변환 로직 제거 (cropping 없으므로 불필요)
+4. `all_page_box_ocrs` 대신 `page_ocr_results` 전달
+
+#### 11.3.2 `surya/api/helpers/format_converter.py`
+
+**수정 함수**: `surya_layout_ocr_to_mineru_format()`
+
+**현재 시그니처**:
+```python
+def surya_layout_ocr_to_mineru_format(
+    layout_results: List[LayoutResult],
+    box_ocr_results: List[List[OCRResult]],  # 페이지 → 박스별 OCR
+    filename: str,
+    page_sizes: List[Tuple[int, int]],
+    include_discarded: bool = False
+) -> dict:
+```
+
+**새로운 시그니처**:
+```python
+def surya_layout_ocr_to_mineru_format(
+    layout_results: List[LayoutResult],
+    page_ocr_results: List[OCRResult],  # 페이지 전체 OCR
+    filename: str,
+    page_sizes: List[Tuple[int, int]],
+    include_discarded: bool = False
+) -> dict:
+```
+
+**새로운 로직**:
+```python
+for page_idx, (layout_result, page_ocr, page_size) in enumerate(
+    zip(layout_results, page_ocr_results, page_sizes)
+):
+    # Step 1: TextLine을 LayoutBox에 매칭
+    matched_lines = match_textlines_to_layout_boxes(
+        page_ocr.text_lines,
+        layout_result.bboxes
+    )
+
+    # Step 2: Orphan lines 처리
+    orphan_lines = matched_lines.get(-1, [])
+    if orphan_lines:
+        orphan_box = create_orphan_layout_box(orphan_lines, page_idx)
+        # orphan_box를 layout_result.bboxes에 추가
+        # orphan_lines를 matched_lines에 추가
+
+    # Step 3: 각 LayoutBox별로 포맷팅
+    for box_id, layout_box in enumerate(layout_result.bboxes):
+        box_type = map_surya_label_to_box_type(layout_box.label)
+
+        # 이 box에 매칭된 TextLine들 가져오기
+        box_text_lines = matched_lines.get(box_id, [])
+
+        # TextLine → MinerU lines 포맷으로 변환
+        lines = format_textlines_to_mineru_lines(box_text_lines)
+
+        # LayoutBox 데이터 생성
+        layout_box_data = {
+            "box_id": box_id,
+            "box_type": box_type,
+            "bbox": layout_box.bbox,
+            "score": layout_box.confidence,
+            "position": layout_box.position,
+            "lines": lines
+        }
+
+        # Discarded vs normal 분리
+        if box_type == "discarded":
+            if include_discarded:
+                discarded_boxes.append(layout_box_data)
+        else:
+            page_data["layout_boxes"].append(layout_box_data)
+```
+
+**새로 추가할 Helper 함수**:
+```python
+def match_textlines_to_layout_boxes(...) -> Dict[int, List[TextLine]]:
+    """TextLine ↔ LayoutBox 매칭 (11.2.1 참조)"""
+
+def point_in_bbox(...) -> bool:
+    """점이 bbox 내부에 있는지 확인"""
+
+def create_orphan_layout_box(...) -> LayoutBox:
+    """Orphan TextLine용 가상 box 생성 (11.2.2 참조)"""
+
+def format_textlines_to_mineru_lines(...) -> List[dict]:
+    """TextLine 리스트를 MinerU lines 포맷으로 변환"""
+    # 기존 로직 재사용 (line 161-187)
+```
+
+---
+
+### 11.4 구현 순서
+
+#### Phase 1: Helper 함수 구현 (1일)
+1. `format_converter.py`에 새로운 helper 함수 추가:
+   - `match_textlines_to_layout_boxes()`
+   - `point_in_bbox()`
+   - `create_orphan_layout_box()`
+   - `format_textlines_to_mineru_lines()` (기존 로직 refactoring)
+
+#### Phase 2: Format Converter 수정 (1일)
+1. `surya_layout_ocr_to_mineru_format()` 함수 수정:
+   - 시그니처 변경: `box_ocr_results` → `page_ocr_results`
+   - TextLine 매칭 로직 추가
+   - Orphan box 처리 로직 추가
+   - Discarded box 처리 로직 유지
+
+#### Phase 3: Endpoint 수정 (1일)
+1. `layout_ocr.py`의 `process_images_with_layout_ocr()` 함수 수정:
+   - Cropping 로직 제거
+   - Page-level OCR로 변경
+   - 좌표 변환 로직 제거
+   - Format converter 호출 부분 수정
+
+#### Phase 4: 테스트 및 검증 (1-2일)
+1. 기본 기능 테스트:
+   - `/layout_ocr` 엔드포인트 동작 확인
+   - `/layout_ocr_images` 엔드포인트 동작 확인
+2. 응답 포맷 검증:
+   - MinerU 클라이언트 호환성 확인
+   - Orphan box 포맷 확인
+   - Discarded box 처리 확인
+3. 성능 측정:
+   - Plan 2 vs Plan 1 처리 시간 비교
+   - 페이지당 처리 시간 측정
+4. Edge case 테스트:
+   - Orphan line이 많은 문서
+   - Layout box가 없는 페이지
+   - Discarded box만 있는 페이지
+
+**총 예상 기간**: 4-5일
+
+---
+
+### 11.5 API 인터페이스 변경 사항
+
+**변경 없음!** 외부에서 보는 API 스펙은 완전히 동일합니다.
+
+#### 요청 포맷 (변경 없음)
+```python
+POST /layout_ocr
+{
+  "files": [File],
+  "lang": "ko",
+  "parse_method": "auto",
+  "include_discarded": false,
+  "start_page_id": 0,
+  "end_page_id": 99999
+}
+
+POST /layout_ocr_images
+{
+  "images": [File],
+  "lang": "ko",
+  "parse_method": "auto",
+  "include_discarded": false
+}
+```
+
+#### 응답 포맷 (거의 동일)
+```json
+{
+  "status": "success",
+  "backend": "surya",
+  "files": [{
+    "filename": "document.pdf",
+    "pages": [{
+      "page_index": 0,
+      "page_size": {"width": 1438, "height": 1928},
+      "layout_boxes": [
+        {
+          "box_id": 0,
+          "box_type": "text",
+          "bbox": [166, 428, 905, 884],
+          "score": 0.95,
+          "position": 0,
+          "lines": [...]
+        },
+        // ... 일반 boxes
+        {
+          "box_id": 99,
+          "box_type": "text",
+          "bbox": [10, 20, 100, 50],
+          "score": 0.0,  // ★ Orphan box 표시
+          "position": 999999,
+          "lines": [...]  // Orphan TextLines
+        }
+      ],
+      "discarded_boxes": [...]  // include_discarded=true인 경우
+    }]
+  }]
+}
+```
+
+**유일한 차이점**:
+- Orphan TextLine이 있는 경우, `score: 0.0`, `position: 999999`인 추가 box가 생성됨
+- 기존 클라이언트는 이를 일반 box로 처리 가능 (하위 호환성 유지)
+
+---
+
+### 11.6 성능 개선 예상
+
+#### 현재 (Plan 2)
+```
+1 페이지 처리:
+  - Layout Detection: 5-10초
+  - Layout Box Cropping: 1-2초
+  - OCR (100+ boxes): 200-300초 (페이지당 수 분!)
+  - Total: ~300초/페이지
+```
+
+#### 개선 후 (Plan 1)
+```
+1 페이지 처리:
+  - Layout Detection: 5-10초
+  - Page OCR (1회): 10-20초
+  - TextLine Matching: <1초
+  - Total: ~20-30초/페이지 (약 10-15배 개선!)
+```
+
+**핵심**:
+- OCR 호출 횟수: 100+ 회/페이지 → 1회/페이지
+- 예상 개선율: **10-15배 속도 향상**
+
+---
+
+### 11.7 향후 개선 사항 (실험적)
+
+현재는 중심점 기준 매칭만 사용하지만, 향후 실험을 통해 다음을 고려할 수 있습니다:
+
+#### 11.7.1 IoU 기반 매칭 (옵션)
+```python
+def calculate_iou(bbox1, bbox2) -> float:
+    """두 bbox의 IoU 계산"""
+    # Intersection area
+    x1 = max(bbox1[0], bbox2[0])
+    y1 = max(bbox1[1], bbox2[1])
+    x2 = min(bbox1[2], bbox2[2])
+    y2 = min(bbox1[3], bbox2[3])
+
+    if x2 < x1 or y2 < y1:
+        return 0.0
+
+    intersection = (x2 - x1) * (y2 - y1)
+
+    # Union area
+    area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+    area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+    union = area1 + area2 - intersection
+
+    return intersection / union if union > 0 else 0.0
+```
+
+**사용 시나리오**:
+- 중심점 기준으로 매칭 실패 시 fallback으로 사용
+- `iou_threshold > 0.5`인 경우 매칭 고려
+
+#### 11.7.2 겹침 비율 기반 매칭 (옵션)
+```python
+def calculate_overlap_ratio(text_bbox, layout_bbox) -> float:
+    """TextLine bbox 면적 중 LayoutBox와 겹치는 비율"""
+    # Similar to IoU but only considers text_bbox area
+```
+
+**사용 시나리오**:
+- TextLine의 80% 이상이 LayoutBox 안에 있으면 매칭
+
+**참고**: 현재는 이러한 복잡한 매칭 로직을 사용하지 않고, 단순한 중심점 기준만 사용합니다. 실험 결과에 따라 추후 추가 검토할 수 있습니다.
+
+---
+
+## 12. 참고 자료
+
+### 12.1 관련 파일
 - `surya/recognition/__init__.py` - OCR 예측 로직
 - `surya/layout/__init__.py` - Layout 예측 로직
 - `surya/scripts/ocr_text.py` - CLI OCR 구현
@@ -854,7 +1321,7 @@ python /Users/pipaek/project/MinerU/examples/layout_ocr_client.py test.pdf \
 - `/Users/pipaek/project/MinerU/mineru/cli/fast_api.py` - MinerU API 참조
 - `/Users/pipaek/project/MinerU/examples/layout_ocr_client.py` - 클라이언트 예제
 
-### 11.2 Surya 데이터 구조
+### 12.2 Surya 데이터 구조
 ```python
 # OCR 결과
 class TextChar(BaseModel):
@@ -892,7 +1359,7 @@ class LayoutResult(BaseModel):
 
 ---
 
-## 12. 결론
+## 13. 결론
 
 이 개발 계획을 통해:
 
@@ -902,11 +1369,13 @@ class LayoutResult(BaseModel):
 4. ✅ Character-level bbox 정확도 개선
 5. ✅ 오픈소스 업데이트에 안전한 구조
 6. ✅ WebSocket 실시간 스트리밍 지원
+7. 🔄 **Plan 1 방식으로 /layout_ocr 성능 개선 (10-15배 속도 향상 목표)**
 
 **핵심 원칙**:
 - Surya 내부 코드 수정 없이 helper 모듈로 확장
 - MinerU 클라이언트 프로그램과 100% 호환
 - 페이지별 병렬 처리로 성능 최적화
 - 명확한 에러 처리 및 진행률 추적
+- **중심점 기반 매칭으로 간단하고 효율적인 구현**
 
-**다음 단계**: Phase 1부터 순차 구현 시작!
+**다음 단계**: Section 11의 Plan 1 재개발 계획에 따라 구현 시작!

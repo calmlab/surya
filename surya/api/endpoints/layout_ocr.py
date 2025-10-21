@@ -20,7 +20,6 @@ from surya.api.helpers.pdf_processor import (
     is_image
 )
 from surya.api.helpers.format_converter import surya_layout_ocr_to_mineru_format
-from surya.api.helpers.image_utils import crop_layout_boxes
 from surya.logging import get_logger
 
 logger = get_logger()
@@ -60,7 +59,10 @@ def process_images_with_layout_ocr(
     layout_predictor
 ):
     """
-    Common logic for processing images with layout detection + OCR
+    Common logic for processing images with layout detection + OCR (Plan 1)
+
+    This implementation uses page-level OCR and matches TextLines to LayoutBoxes,
+    rather than cropping each box and running OCR separately.
 
     Args:
         images: List of PIL images
@@ -77,58 +79,27 @@ def process_images_with_layout_ocr(
     layout_results = layout_predictor(images)
     logger.info(f"  Layout detection completed for {len(layout_results)} pages")
 
-    # Step 2: Process each page - crop boxes and run OCR
-    all_page_box_ocrs = []
+    # Step 2: Run page-level OCR (once per page)
+    logger.info(f"  Running page-level OCR on {len(images)} pages...")
+    page_ocr_results = recognition_predictor(
+        images,
+        det_predictor=detection_predictor
+    )
+    logger.info(f"  Page-level OCR completed for {len(page_ocr_results)} pages")
 
-    for page_idx, (image, layout_result) in enumerate(zip(images, layout_results)):
-        logger.info(f"    [Page {page_idx + 1}/{len(images)}] Found {len(layout_result.bboxes)} layout boxes")
-
-        # Crop layout boxes from this page
-        cropped_boxes = crop_layout_boxes(image, layout_result.bboxes, padding=5)
-        cropped_images = [crop[0] for crop in cropped_boxes]
-
-        if len(cropped_images) == 0:
-            logger.warning(f"    [Page {page_idx + 1}] No layout boxes found, skipping OCR")
-            all_page_box_ocrs.append([])
-            continue
-
-        # Run OCR on all cropped boxes for this page
-        logger.info(f"    [Page {page_idx + 1}] Running OCR on {len(cropped_images)} boxes...")
-        box_ocr_results = recognition_predictor(
-            cropped_images,
-            det_predictor=detection_predictor
+    # Log summary for each page
+    for page_idx, (layout_result, ocr_result) in enumerate(zip(layout_results, page_ocr_results)):
+        logger.info(
+            f"    [Page {page_idx + 1}/{len(images)}] "
+            f"Found {len(layout_result.bboxes)} layout boxes, "
+            f"{len(ocr_result.text_lines)} text lines"
         )
-        logger.info(f"    [Page {page_idx + 1}] OCR completed for {len(box_ocr_results)} boxes")
 
-        # Adjust bbox coordinates from cropped to original image coordinates
-        for box_idx, (ocr_result, (_, layout_box)) in enumerate(
-            zip(box_ocr_results, cropped_boxes)
-        ):
-            # Get the crop offset (top-left corner of layout box)
-            x_offset = float(layout_box.bbox[0])
-            y_offset = float(layout_box.bbox[1])
-
-            # Adjust all text line coordinates using shift() method
-            for text_line in ocr_result.text_lines:
-                text_line.shift(x_shift=x_offset, y_shift=y_offset)
-
-                # Adjust character coordinates
-                for char in text_line.chars:
-                    if char.bbox_valid:
-                        char.shift(x_shift=x_offset, y_shift=y_offset)
-
-                # Adjust word coordinates if available
-                if text_line.words:
-                    for word in text_line.words:
-                        word.shift(x_shift=x_offset, y_shift=y_offset)
-
-        all_page_box_ocrs.append(box_ocr_results)
-
-    # Step 3: Convert to MinerU format
+    # Step 3: Convert to MinerU format (TextLine matching happens in format_converter)
     logger.info(f"  Formatting results to MinerU format...")
     formatted_result = surya_layout_ocr_to_mineru_format(
         layout_results,
-        all_page_box_ocrs,
+        page_ocr_results,
         filename,
         page_sizes,
         include_discarded
