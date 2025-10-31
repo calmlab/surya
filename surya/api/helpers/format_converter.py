@@ -36,6 +36,37 @@ def map_surya_label_to_box_type(label: str) -> str:
     return LABEL_TO_BOX_TYPE.get(label, "text")
 
 
+# ============================================================================
+# Coordinate helpers (Surya-space -> Top-left origin client-space)
+# ============================================================================
+
+def flip_bbox_y(bbox: List[float], page_height: int) -> List[float]:
+    """Flip bbox Y-axis from bottom-left origin to top-left origin.
+
+    Args:
+        bbox: [x0, y0, x1, y1] in Surya-space (y upward)
+        page_height: page/image height in pixels
+
+    Returns:
+        [x0, y0', x1, y1'] with top-left origin (y downward)
+    """
+    x0, y0, x1, y1 = bbox
+    return [x0, page_height - y1, x1, page_height - y0]
+
+
+def flip_polygon_y(polygon: List[List[float]], page_height: int) -> List[List[float]]:
+    """Flip polygon Y-axis from bottom-left origin to top-left origin.
+
+    Args:
+        polygon: list of [x, y] points in Surya-space (y upward)
+        page_height: page/image height in pixels
+
+    Returns:
+        polygon with y mapped to (H - y)
+    """
+    return [[pt[0], page_height - pt[1]] for pt in polygon]
+
+
 def surya_ocr_to_page_format(
     ocr_results: List[OCRResult],
     filename: str,
@@ -68,6 +99,8 @@ def surya_ocr_to_page_format(
             "text_lines": []
         }
 
+        page_height = page_size[1]
+
         for line_id, text_line in enumerate(ocr_result.text_lines):
             # Extract characters (actually tokens) with valid bboxes
             characters = []
@@ -75,7 +108,7 @@ def surya_ocr_to_page_format(
                 if char.bbox_valid:
                     char_data = {
                         "char": char.text,
-                        "bbox": char.bbox,
+                        "bbox": flip_bbox_y(char.bbox, page_height),
                         "confidence": char.confidence,
                         "char_index": char_idx
                     }
@@ -87,14 +120,14 @@ def surya_ocr_to_page_format(
                 for word in text_line.words:
                     words.append({
                         "text": word.text,
-                        "bbox": word.bbox,
+                        "bbox": flip_bbox_y(word.bbox, page_height),
                         "confidence": word.confidence
                     })
 
             line_data = {
                 "line_id": line_id,
-                "bbox": text_line.bbox,
-                "polygon": text_line.polygon,
+                "bbox": flip_bbox_y(text_line.bbox, page_height),
+                "polygon": flip_polygon_y(text_line.polygon, page_height),
                 "text": text_line.text,
                 "confidence": text_line.confidence,
                 "characters": characters,
@@ -143,6 +176,8 @@ def surya_layout_ocr_to_mineru_format(
     for page_idx, (layout_result, page_ocr, page_size) in enumerate(
         zip(layout_results, page_ocr_results, page_sizes)
     ):
+        page_height = page_size[1]
+
         page_data = {
             "page_index": page_idx,
             "page_size": {"width": page_size[0], "height": page_size[1]},
@@ -180,13 +215,13 @@ def surya_layout_ocr_to_mineru_format(
             box_text_lines = matched_lines.get(box_id, [])
 
             # Convert TextLines to MinerU lines format
-            lines = format_textlines_to_mineru_lines(box_text_lines)
+            lines = format_textlines_to_mineru_lines(box_text_lines, page_height)
 
             # Create layout box data
             layout_box_data = {
                 "box_id": box_id,
                 "box_type": box_type,
-                "bbox": layout_box.bbox,
+                "bbox": flip_bbox_y(layout_box.bbox, page_height),
                 "score": layout_box.confidence,
                 "position": layout_box.position,
                 "lines": lines
@@ -312,7 +347,7 @@ def create_orphan_layout_box(
     return orphan_box
 
 
-def format_textlines_to_mineru_lines(text_lines: List[TextLine]) -> List[dict]:
+def format_textlines_to_mineru_lines(text_lines: List[TextLine], page_height: int) -> List[dict]:
     """
     Convert list of TextLine objects to MinerU lines format
 
@@ -334,7 +369,7 @@ def format_textlines_to_mineru_lines(text_lines: List[TextLine]) -> List[dict]:
             if char.bbox_valid:
                 characters.append({
                     "char": char.text,
-                    "bbox": char.bbox,
+                    "bbox": flip_bbox_y(char.bbox, page_height),
                     "confidence": char.confidence,
                     "char_index": char_idx
                 })
@@ -342,7 +377,7 @@ def format_textlines_to_mineru_lines(text_lines: List[TextLine]) -> List[dict]:
         # Create spans (MinerU format uses spans)
         spans = [{
             "type": "text",
-            "bbox": text_line.bbox,
+            "bbox": flip_bbox_y(text_line.bbox, page_height),
             "content": text_line.text,
             "confidence": text_line.confidence,
             "characters": characters
@@ -351,7 +386,7 @@ def format_textlines_to_mineru_lines(text_lines: List[TextLine]) -> List[dict]:
         # Create line data
         line_data = {
             "line_index": line_id,
-            "bbox": text_line.bbox,
+            "bbox": flip_bbox_y(text_line.bbox, page_height),
             "text": text_line.text,
             "confidence": text_line.confidence,
             "spans": spans

@@ -12,6 +12,7 @@ from surya.foundation import FoundationPredictor
 from surya.detection import DetectionPredictor
 from surya.recognition import RecognitionPredictor
 from surya.api.config import settings
+from surya.api.helpers.format_converter import flip_bbox_y, flip_polygon_y
 from surya.logging import get_logger
 
 logger = get_logger()
@@ -130,6 +131,7 @@ async def image_ocr(request: ImageOCRRequest):
         results = []
         for image_id, ocr_result, img in zip(image_ids, ocr_results, pil_images):
             text_lines = []
+            page_height = img.height
 
             for line_id, text_line in enumerate(ocr_result.text_lines):
                 # Extract characters (tokens) with valid bboxes
@@ -138,7 +140,7 @@ async def image_ocr(request: ImageOCRRequest):
                     if char.bbox_valid:
                         characters.append({
                             "char": char.text,
-                            "bbox": char.bbox,
+                            "bbox": flip_bbox_y(char.bbox, page_height),
                             "confidence": char.confidence,
                             "char_index": char_idx
                         })
@@ -149,15 +151,15 @@ async def image_ocr(request: ImageOCRRequest):
                     for word in text_line.words:
                         words.append({
                             "text": word.text,
-                            "bbox": word.bbox,
+                            "bbox": flip_bbox_y(word.bbox, page_height),
                             "confidence": word.confidence
                         })
 
                 text_lines.append({
                     "line_id": line_id,
                     "text": text_line.text,
-                    "bbox": text_line.bbox,
-                    "polygon": text_line.polygon,
+                    "bbox": flip_bbox_y(text_line.bbox, page_height),
+                    "polygon": flip_polygon_y(text_line.polygon, page_height),
                     "confidence": text_line.confidence,
                     "characters": characters,
                     "words": words
