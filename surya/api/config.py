@@ -22,6 +22,10 @@ class APISettings(BaseSettings):
     # Temporary directory
     TEMP_DIR: str = "./temp"
 
+    # Debug settings
+    DEBUG_LOG_ENABLED: bool = True  # Enable detailed per-page debug logging
+    DEBUG_LOG_DIR: str = "./temp/debug_logs"  # Directory for debug logs
+
     # CORS settings
     ALLOW_ORIGINS: list = ["*"]
     ALLOW_CREDENTIALS: bool = True

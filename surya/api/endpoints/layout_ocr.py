@@ -20,6 +20,7 @@ from surya.api.helpers.pdf_processor import (
     is_image
 )
 from surya.api.helpers.format_converter import surya_layout_ocr_to_mineru_format
+from surya.api.helpers.debug_logger import PageDebugLogger
 from surya.logging import get_logger
 
 logger = get_logger()
@@ -56,7 +57,8 @@ def process_images_with_layout_ocr(
     foundation_predictor,
     detection_predictor,
     recognition_predictor,
-    layout_predictor
+    layout_predictor,
+    request_id: str = None
 ):
     """
     Common logic for processing images with layout detection + OCR (Plan 1)
@@ -70,10 +72,15 @@ def process_images_with_layout_ocr(
         filename: Original filename for result
         include_discarded: Include discarded boxes
         predictors: All required predictors
+        request_id: Unique request ID for debug logging
 
     Returns:
         Formatted result in MinerU format
     """
+    # Initialize debug logger
+    debug_logger = None
+    if request_id:
+        debug_logger = PageDebugLogger(request_id, filename)
     # Step 1: Run layout detection
     logger.info(f"  Running layout detection on {len(images)} pages...")
     layout_results = layout_predictor(images)
@@ -102,8 +109,13 @@ def process_images_with_layout_ocr(
         page_ocr_results,
         filename,
         page_sizes,
-        include_discarded
+        include_discarded,
+        debug_logger=debug_logger
     )
+
+    # Write summary log
+    if debug_logger:
+        debug_logger.log_summary(total_pages=len(images))
 
     return formatted_result
 
@@ -185,7 +197,8 @@ async def layout_ocr_images(
             foundation_predictor,
             detection_predictor,
             recognition_predictor,
-            layout_predictor
+            layout_predictor,
+            request_id=unique_dir.split("/")[-1]  # Use unique_dir basename as request_id
         )
 
         # Cleanup temp files
@@ -303,7 +316,8 @@ async def layout_ocr(
                 foundation_predictor,
                 detection_predictor,
                 recognition_predictor,
-                layout_predictor
+                layout_predictor,
+                request_id=unique_dir.split("/")[-1]  # Use unique_dir basename as request_id
             )
 
             all_results.append(formatted_result)

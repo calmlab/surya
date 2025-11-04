@@ -2,6 +2,9 @@
 from typing import List, Tuple, Dict, Any, Optional
 from surya.recognition.schema import OCRResult, TextLine
 from surya.layout.schema import LayoutResult, LayoutBox
+from surya.logging import get_logger
+
+logger = get_logger()
 
 
 # Surya label to MinerU box_type mapping
@@ -104,15 +107,17 @@ def surya_ocr_to_page_format(
         for line_id, text_line in enumerate(ocr_result.text_lines):
             # Extract characters (actually tokens) with valid bboxes
             characters = []
-            for char_idx, char in enumerate(text_line.chars):
+            valid_char_idx = 0  # Counter for valid characters only
+            for char in text_line.chars:
                 if char.bbox_valid:
                     char_data = {
                         "char": char.text,
                         "bbox": flip_bbox_y(char.bbox, page_height),
                         "confidence": char.confidence,
-                        "char_index": char_idx
+                        "char_index": valid_char_idx
                     }
                     characters.append(char_data)
+                    valid_char_idx += 1
 
             # Extract words if available
             words = []
@@ -146,7 +151,8 @@ def surya_layout_ocr_to_mineru_format(
     page_ocr_results: List[OCRResult],
     filename: str,
     page_sizes: List[Tuple[int, int]],
-    include_discarded: bool = False
+    include_discarded: bool = False,
+    debug_logger=None
 ) -> dict:
     """
     Convert Surya Layout + OCR results to MinerU format (Plan 1)
@@ -160,6 +166,7 @@ def surya_layout_ocr_to_mineru_format(
         filename: Source filename
         page_sizes: List of (width, height) tuples for each page
         include_discarded: Whether to include discarded boxes (PageHeader, PageFooter)
+        debug_logger: Optional PageDebugLogger instance for detailed logging
 
     Returns:
         MinerU-compatible JSON structure
@@ -196,6 +203,25 @@ def surya_layout_ocr_to_mineru_format(
         orphan_lines = matched_lines.get(-1, [])
         layout_boxes = list(layout_result.bboxes)  # Copy to allow modification
 
+        # Log page processing details if debug logger provided
+        if debug_logger:
+            debug_logger.log_page_processing(
+                page_idx=page_idx,
+                layout_boxes=layout_boxes,
+                text_lines=page_ocr.text_lines,
+                matched_lines=matched_lines,
+                page_size=page_size
+            )
+
+        # Log summary statistics
+        total_matched = sum(len(lines) for idx, lines in matched_lines.items() if idx != -1)
+        logger.info(
+            f"  [Page {page_idx}] Layout boxes: {len(layout_boxes)}, "
+            f"Text lines: {len(page_ocr.text_lines)}, "
+            f"Matched: {total_matched}, "
+            f"Orphans: {len(orphan_lines)}"
+        )
+
         if orphan_lines:
             # Create virtual orphan box
             orphan_box = create_orphan_layout_box(orphan_lines, page_idx)
@@ -205,6 +231,7 @@ def surya_layout_ocr_to_mineru_format(
                 layout_boxes.append(orphan_box)
                 # Add orphan lines to matched_lines
                 matched_lines[orphan_box_idx] = orphan_lines
+                logger.info(f"  [Page {page_idx}] Created orphan box with {len(orphan_lines)} lines")
 
         # Step 3: Process each layout box (including orphan box if created)
         for box_id, layout_box in enumerate(layout_boxes):
@@ -365,14 +392,16 @@ def format_textlines_to_mineru_lines(text_lines: List[TextLine], page_height: in
     for line_id, text_line in enumerate(text_lines):
         # Extract characters (actually tokens) with valid bboxes
         characters = []
-        for char_idx, char in enumerate(text_line.chars):
+        valid_char_idx = 0  # Counter for valid characters only
+        for char in text_line.chars:
             if char.bbox_valid:
                 characters.append({
                     "char": char.text,
                     "bbox": flip_bbox_y(char.bbox, page_height),
                     "confidence": char.confidence,
-                    "char_index": char_idx
+                    "char_index": valid_char_idx
                 })
+                valid_char_idx += 1
 
         # Create spans (MinerU format uses spans)
         spans = [{
