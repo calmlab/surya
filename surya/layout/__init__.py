@@ -47,8 +47,16 @@ class LayoutPredictor(BasePredictor):
         if len(images) == 0:
             return []
 
+        # Log original image sizes
+        original_sizes = [(img.size if hasattr(img, 'size') else (img.width, img.height)) for img in images]
+        logger.info(f"[LayoutPredictor] Original image sizes: {original_sizes}")
+
         images = convert_if_not_rgb(images)
         images = [self.processor.image_processor(image) for image in images]
+
+        # Log processed image sizes
+        processed_sizes = [img.shape if hasattr(img, 'shape') else img.size for img in images]
+        logger.info(f"[LayoutPredictor] Processed image sizes (after image_processor): {processed_sizes}")
 
         predicted_tokens, batch_bboxes, scores, topk_scores = (
             self.foundation_predictor.prediction_loop(
